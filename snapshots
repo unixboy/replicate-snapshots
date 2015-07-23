@@ -1,0 +1,289 @@
+#!/usr/bin/env python
+#
+# ec2-replicate-snapshots
+#
+# ATonns Tue May 21 16:06:37 EDT 2013
+#
+#   Copyright 2013 Corsis
+#   http://www.corsis.com/
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+import argparse
+import boto
+import boto.ec2
+import logging
+import logging.handlers
+import sys
+import time
+
+progname = "ec2-replicate-snapshots"
+
+# default log level
+loglevel = logging.INFO
+# how long to wait for copy operations
+sourceTimeout = 1800  # 30 minutes
+copyTimeout = 1800  # 30 minutes
+destinationTimeout = 21600  # 6 hours
+sleepTime = 60  # 1 minute
+
+
+# fix python brokenness in CentOS/RHEL/Amazon Linux
+# http://serverfault.com/a/408491/22362
+class myFormatter(logging.Formatter):
+    def format(self, record):
+        return logging.Formatter.format(self, record).encode('utf-8')
+
+
+if __name__ == '__main__':
+    # root logger
+    logging.basicConfig(level=logging.DEBUG, filename='/dev/null')
+    # setup arguments
+    parser = argparse.ArgumentParser(
+        prog=progname,
+        description="Copies EC2 snapshots from one region to another"
+    )
+    parser.add_argument(
+        "-D", "--debug",
+        help="output at debug level",
+        action="store_true"
+    )
+    parser.add_argument(
+        "-B", "--botodebug",
+        help="enable boto debugging (not enabled with -D)",
+        action="store_true"
+    )
+    parser.add_argument(
+        "-s", "--source",
+        help="Source EC2 region",
+        required=True
+    )
+    parser.add_argument(
+        "-d", "--destination",
+        help="Destination EC2 region",
+        required=True
+    )
+    args = parser.parse_args()
+    # set log level for our messages
+    if args.debug:
+        loglevel = logging.DEBUG
+    # set boto log level independently
+    if args.botodebug:
+        logging.getLogger('boto').setLevel(logging.DEBUG)
+    else:
+        logging.getLogger('boto').setLevel(logging.CRITICAL)
+    # create a syslog handler
+    syslogLogger = logging.handlers.SysLogHandler(address='/dev/log')
+    syslogLogger.setLevel(loglevel)
+    syslogLogger.setFormatter(myFormatter(
+        progname + ": %(levelname)s %(message)s"))
+    logging.getLogger('').addHandler(syslogLogger)
+    # argument review
+    if args.debug:
+        logging.debug("args: script output set to debug")
+    if args.botodebug:
+        logging.debug("args: boto output set to debug")
+    sourceRegion = args.source
+    logging.debug("args: source ec2 region is '%s'", sourceRegion)
+    destinationRegion = args.destination
+    logging.debug("args: destination ec2 region is '%s'", destinationRegion)
+    # connect to aws
+    logging.debug("connecting to AWS APIs")
+    try:
+        src = boto.ec2.connect_to_region(sourceRegion)
+        dst = boto.ec2.connect_to_region(destinationRegion)
+    except boto.exception.NoAuthHandlerFound:
+        logging.error("AWS authentication error, quitting")
+        sys.exit(2)
+    logging.info("established connection to AWS APIs")
+    #
+    # get the snapshots we're going to copy
+    #
+    lines = sys.stdin.readlines()
+    for i in range(len(lines)):
+        lines[i] = lines[i].replace('\n', '')
+    if len(lines) < 1:
+        logging.error("no snapshots found on stdin")
+        sys.exit(2)
+    #
+    # get the snapshot objects
+    #
+    sourceSnapshots = src.get_all_snapshots(
+        owner="self",
+        snapshot_ids=lines,
+    )
+    #
+    # sort them
+    #
+    sourceSnapshots = sorted(sourceSnapshots, key=lambda x: x.description)
+    allSnapshots = range(len(sourceSnapshots))
+    #
+    # check them
+    #
+    logging.info("checking the status of source snapshots")
+    sourceSnapshotsDone = [False for x in allSnapshots]
+    wait = 0
+    done = False
+    while not done:
+        for i in allSnapshots:
+            # skip if it's already done
+            if not sourceSnapshotsDone[i]:
+                # get the latest status
+                sourceSnapshots[i].update()
+                # see if it's completed
+                if sourceSnapshots[i].status == 'completed':
+                    # flag it as done
+                    sourceSnapshotsDone[i] = True
+                    logging.info("snapshot '%s:%s' is 'completed'",
+                                 sourceRegion, sourceSnapshots[i].id)
+                else:
+                    # not done yet
+                    logging.debug(
+                        "snapshot %s:%s is %s (%s/%s)",
+                        sourceRegion, sourceSnapshots[i].id,
+                        sourceSnapshots[i].status,
+                        wait, sourceTimeout,
+                    )
+        # check to see if we're really done yet
+        hasHope = True
+        for snapshotDone in sourceSnapshotsDone:
+            if not snapshotDone:
+                hasHope = False
+        if hasHope or wait > sourceTimeout:
+            done = True
+        else:
+            time.sleep(sleepTime)
+            wait += sleepTime
+    # did we quit for the wrong reason?
+    if wait > sourceTimeout:
+        logging.error(
+            "timeout waiting for some source snapshots to be completed"
+        )
+        sys.exit(1)
+    else:
+        logging.info("all source snapshots completed")
+    #
+    # copy them
+    #
+    logging.info("copying snapshots from source to destination")
+    sourceSnapshotsCopied = [False for x in allSnapshots]
+    destinationSnapshots = [None for x in allSnapshots]
+    wait = 0
+    done = False
+    while not done:
+        for i in allSnapshots:
+            # skip if the copy already started
+            if not sourceSnapshotsCopied[i]:
+                sourceDescription = sourceSnapshots[i].description
+                sourceId = sourceSnapshots[i].id
+                sourceVolumeId = sourceSnapshots[i].volume_id
+                # no way of knowing if this will work,
+                # so let's just try to copy it
+                try:
+                    destinationId = dst.copy_snapshot(
+                        source_region=sourceRegion,
+                        source_snapshot_id=sourceId,
+                        description=sourceDescription,
+                    )
+                except:
+                    # boo, not enough copy slots
+                    logging.debug(
+                        "could not copy snapshot from %s:%s to %s (%s/%s)",
+                        sourceRegion, sourceId,
+                        destinationRegion,
+                        wait, copyTimeout,
+                    )
+                else:
+                    # it worked!
+                    # give it a sec
+                    time.sleep(1)
+                    # track the snapshot at the destination
+                    destinationSnapshots[i] = dst.get_all_snapshots(
+                        snapshot_ids=[destinationId]
+                    )[0]
+                    # add the necessary tags
+                    destinationSnapshots[i].add_tag(
+                        "MasterVolumeId", sourceVolumeId
+                    )
+                    # flag as done
+                    sourceSnapshotsCopied[i] = True
+                    logging.info(
+                        "started copy of snapshot from %s:%s to %s:%s - '%s'",
+                        sourceRegion, sourceId,
+                        destinationRegion, destinationId,
+                        sourceDescription,
+                    )
+        # check to see if we're really done yet
+        hasHope = True
+        for snapshotCopied in sourceSnapshotsCopied:
+            if not snapshotCopied:
+                hasHope = False
+        if hasHope or wait > copyTimeout:
+            done = True
+        else:
+            time.sleep(sleepTime)
+            wait += sleepTime
+    # did we quit for the wrong reason?
+    if wait > copyTimeout:
+        logging.error("some snapshot copies did not start")
+    else:
+        logging.info("all snapshot copies started")
+    #
+    # check for snapshots to be completed at the destination
+    #
+    logging.info("checking the status of destination snapshots")
+    destinationSnapshotsDone = [False for x in allSnapshots]
+    # if the copy was never started, consider it "done"
+    # e.g. don't bother checking it
+    for i in allSnapshots:
+        if not hasattr(destinationSnapshots[i], 'status'):
+            destinationSnapshotsDone[i] = True
+    wait = 0
+    done = False
+    while not done:
+        for i in allSnapshots:
+            # skip if it's already completed or wasn't started
+            if not destinationSnapshotsDone[i]:
+                # get the latest status
+                destinationSnapshots[i].update()
+                if destinationSnapshots[i].status == 'completed':
+                    # flag as done if completed
+                    destinationSnapshotsDone[i] = True
+                    logging.info("snapshot '%s:%s' is 'completed'",
+                                 destinationRegion,
+                                 destinationSnapshots[i].id)
+                else:
+                    # not done yet
+                    logging.debug(
+                        "snapshot '%s:%s' is '%s' (%s/%s)",
+                        destinationRegion,
+                        destinationSnapshots[i].id,
+                        destinationSnapshots[i].status,
+                        wait,
+                        destinationTimeout,
+                    )
+        # check to see if we're really done yet
+        hasHope = True
+        for snapshotDone in destinationSnapshotsDone:
+            if not snapshotDone:
+                hasHope = False
+        if hasHope or wait > destinationTimeout:
+            done = True
+        else:
+            time.sleep(sleepTime)
+            wait += sleepTime
+    # did we quit for the wrong reason?
+    if wait > destinationTimeout:
+        logging.error("some snapshot copies did not complete")
+    else:
+        logging.info("all snapshot copies completed")
